@@ -54,22 +54,56 @@ public final class EncryptInsertValueParameterRewriter extends EncryptParameterR
                 encryptAlgorithm -> encryptInsertValues((GroupedParameterBuilder) parameterBuilder, insertStatementContext, encryptAlgorithm, tableName, columnName));
         }
     }
-    
+
     private void encryptInsertValues(final GroupedParameterBuilder parameterBuilder,
-                                     final InsertStatementContext insertStatementContext, final EncryptAlgorithm encryptAlgorithm, final String tableName, final String encryptLogicColumnName) {
-        int columnIndex = getColumnIndex(parameterBuilder, insertStatementContext, encryptLogicColumnName);
+                                     final InsertStatementContext insertStatementContext, final Encryptor encryptor, final String tableName, final String encryptLogicColumnName) {
         int count = 0;
         for (List<Object> each : insertStatementContext.getGroupedParameters()) {
+            int columnIndex = getColumnIndex(parameterBuilder, insertStatementContext, insertStatementContext.getInsertValueContexts().get(count), encryptLogicColumnName);
+            int valueIndex = getValueIndex(parameterBuilder, insertStatementContext, encryptLogicColumnName);
             if (!each.isEmpty()) {
                 StandardParameterBuilder standardParameterBuilder = parameterBuilder.getParameterBuilders().get(count);
-                encryptInsertValue(
-                        encryptAlgorithm, tableName, columnIndex, insertStatementContext.getInsertValueContexts().get(count).getValue(columnIndex), standardParameterBuilder, encryptLogicColumnName);
+                ExpressionSegment expressionSegment = insertStatementContext.getInsertValueContexts().get(count).getValueExpressions().get(valueIndex);
+                if (expressionSegment instanceof ParameterMarkerExpressionSegment) {
+                    encryptInsertValue(
+                            encryptor, tableName, columnIndex, insertStatementContext.getInsertValueContexts().get(count).getValue(valueIndex), standardParameterBuilder, encryptLogicColumnName);
+                } else {
+                    encryptInsertValueLiteral(
+                            encryptor, tableName, columnIndex, insertStatementContext.getInsertValueContexts().get(count).getValue(valueIndex), standardParameterBuilder, encryptLogicColumnName);
+                }
             }
             count++;
         }
     }
-    
-    private int getColumnIndex(final GroupedParameterBuilder parameterBuilder, final InsertStatementContext insertStatementContext, final String encryptLogicColumnName) {
+
+    private int getColumnIndex(final GroupedParameterBuilder parameterBuilder, final InsertStatementContext insertStatementContext, InsertValueContext insertValueContext, final String encryptLogicColumnName) {
+        List<String> columnNames;
+        if (parameterBuilder.getDerivedColumnName().isPresent()) {
+            columnNames = new ArrayList<>(insertStatementContext.getColumnNames());
+            columnNames.remove(parameterBuilder.getDerivedColumnName().get());
+        } else {
+            columnNames = insertStatementContext.getColumnNames();
+        }
+        int columnIndex = columnNames.indexOf(encryptLogicColumnName);
+
+        List<InsertValueContext> insertValueContexts = insertStatementContext.getInsertValueContexts();
+        if (!insertValueContexts.isEmpty()) {
+            if (columnNames.size() != insertValueContext.getParametersCount()) {
+                List<ExpressionSegment> valueExpressions = insertValueContext.getValueExpressions();
+                int position = columnIndex;
+                for (int i = 0; i < columnIndex; i++) {
+                    ExpressionSegment each = valueExpressions.get(i);
+                    if (!(each instanceof ParameterMarkerExpressionSegment)) {
+                        position--;
+                    }
+                }
+                columnIndex = position;
+            }
+        }
+        return columnIndex;
+    }
+
+    private int getValueIndex(final GroupedParameterBuilder parameterBuilder, final InsertStatementContext insertStatementContext, final String encryptLogicColumnName) {
         List<String> columnNames;
         if (parameterBuilder.getDerivedColumnName().isPresent()) {
             columnNames = new ArrayList<>(insertStatementContext.getColumnNames());
@@ -79,18 +113,15 @@ public final class EncryptInsertValueParameterRewriter extends EncryptParameterR
         }
         return columnNames.indexOf(encryptLogicColumnName);
     }
-    
-    private void encryptInsertValue(final EncryptAlgorithm encryptAlgorithm, final String tableName, final int columnIndex,
+
+    private void encryptInsertValue(final Encryptor encryptor, final String tableName, final int columnIndex,
                                     final Object originalValue, final StandardParameterBuilder parameterBuilder, final String encryptLogicColumnName) {
-        // FIXME: can process all part of insert value is ? or literal, can not process mix ? and literal
-        // For example: values (?, ?), (1, 1) can process
-        // For example: values (?, 1), (?, 2) can not process
-        parameterBuilder.addReplacedParameters(columnIndex, encryptAlgorithm.encrypt(originalValue));
+        parameterBuilder.addReplacedParameters(columnIndex, encryptor.encrypt(originalValue));
         Collection<Object> addedParameters = new LinkedList<>();
-        if (encryptAlgorithm instanceof QueryAssistedEncryptAlgorithm) {
+        if (encryptor instanceof QueryAssistedEncryptor) {
             Optional<String> assistedColumnName = getEncryptRule().findAssistedQueryColumn(tableName, encryptLogicColumnName);
             Preconditions.checkArgument(assistedColumnName.isPresent(), "Can not find assisted query Column Name");
-            addedParameters.add(((QueryAssistedEncryptAlgorithm) encryptAlgorithm).queryAssistedEncrypt(originalValue.toString()));
+            addedParameters.add(((QueryAssistedEncryptor) encryptor).queryAssistedEncrypt(originalValue.toString()));
         }
         if (getEncryptRule().findPlainColumn(tableName, encryptLogicColumnName).isPresent()) {
             addedParameters.add(originalValue);
@@ -100,6 +131,25 @@ public final class EncryptInsertValueParameterRewriter extends EncryptParameterR
                 parameterBuilder.getAddedIndexAndParameters().put(columnIndex + 1, new LinkedList<>());
             }
             parameterBuilder.getAddedIndexAndParameters().get(columnIndex + 1).addAll(addedParameters);
+        }
+    }
+
+    private void encryptInsertValueLiteral(final Encryptor encryptor, final String tableName, final int columnIndex,
+                                           final Object originalValue, final StandardParameterBuilder parameterBuilder, final String encryptLogicColumnName) {
+        Collection<Object> addedParameters = new LinkedList<>();
+        if (encryptor instanceof QueryAssistedEncryptor) {
+            Optional<String> assistedColumnName = getEncryptRule().findAssistedQueryColumn(tableName, encryptLogicColumnName);
+            Preconditions.checkArgument(assistedColumnName.isPresent(), "Can not find assisted query Column Name");
+            addedParameters.add(((QueryAssistedEncryptor) encryptor).queryAssistedEncrypt(originalValue.toString()));
+        }
+        if (getEncryptRule().findPlainColumn(tableName, encryptLogicColumnName).isPresent()) {
+            addedParameters.add(originalValue);
+        }
+        if (!addedParameters.isEmpty()) {
+            if (!parameterBuilder.getAddedIndexAndParameters().containsKey(columnIndex)) {
+                parameterBuilder.getAddedIndexAndParameters().put(columnIndex, new LinkedList<>());
+            }
+            parameterBuilder.getAddedIndexAndParameters().get(columnIndex).addAll(addedParameters);
         }
     }
 }
